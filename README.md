@@ -1,84 +1,96 @@
-# FSR 4.1.1 for BeamNG.drive on Linux (unofficial)
+# beamng-fsr4-linux-nix
 
-Replaces the final stage of BeamNG.drive's built-in FSR upscaler with AMD FSR 4.1.1 (the machine-learning
-upscaler) in the **native Linux** version of the game. It runs as a Vulkan layer: no Wine, Proton or
-DirectX, and no game files are modified.
+vulkan layer that runs AMD FSR 4.1.1 in place of BeamNG.drive's "FSR 3 (custom)" upscaler in the native
+Linux build of the game, packaged as a Nix flake, proton isn't supported and it doesn't touch game files. if, in case, there is a conflict (for example, an update), then it falls back to FSR3
 
-> **Status: early release (0.1.0).** Tested on one system (RX 6700 XT, Mesa RADV, BeamNG 0.40, launched from
-> Steam). Other GPUs are untested; reports are welcome (see [Reporting problems](#reporting-problems)).
-> Unofficial, not affiliated with or endorsed by AMD or BeamNG GmbH.
-
-## What you get
-
-- **The real FSR 4.1.1 network.** The shaders and weights derive from AMD's signed FSR 4.1.1 DLL
-  (FidelityFX SDK 2.3.0, INT8 path). On the test GPU the Vulkan port matches AMD's DLL byte for byte, and
-  the frames shown in-game match that port byte for byte. See [docs/VERIFICATION.md](docs/VERIFICATION.md).
-- **Image quality instead of speed.** On RDNA 2, FSR 4 costs more GPU time than BeamNG's FSR 3. Use it
-  for a cleaner image, or pair it with a lower render scale. Measured numbers are in
-  [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
-- **Safe fallback.** If anything looks unexpected (game update, other upscaler mode, unsupported size),
-  the game's own FSR 3 runs untouched.
+Based on [Mob1K7105/beamng-fsr4-linux](https://github.com/Mob1K7105/beamng-fsr4-linux). The FSR 4.1.1
+runtime comes from [johnpanos/FSR-4.1.1-linux](https://github.com/johnpanos/FSR-4.1.1-linux). Not affiliated
+with AMD or BeamNG GmbH.
 
 ## Requirements
 
-| | |
-|---|---|
-| Game | BeamNG.drive **0.40.0.0**, native Linux build (`BinLinux/BeamNG.drive.x64`), Vulkan renderer |
-| In-game setting | Anti-aliasing: **FSR 3 (custom)**, i.e. BeamNG's `fsrCustom` upscaler, at any render scale (shown as "FSR 4.1.1 (Linux)" with the menu-label mod) |
-| GPU | AMD RDNA 2 or newer on Mesa RADV (tested: RX 6700 XT, Mesa 26.2.4) |
-| Vulkan features | 1.3, shaderInt8, shaderIntegerDotProduct, 16-bit arithmetic, `VK_KHR_push_descriptor`, `VK_KHR_compute_shader_derivatives`; `VK_VALVE_shader_mixed_float_dot_product` used when present |
-| Output size | Up to 3840×2160 |
+- BeamNG.drive 0.40, native build (`BinLinux/BeamNG.drive.x64`)
+- Anti-aliasing set to **FSR 3 (custom)**, any render scale
+- An AMD RDNA 2+ GPU on RADV with `shaderInt8` and `shaderIntegerDotProduct`. With
+  `VK_VALVE_shader_mixed_float_dot_product` the output matches AMD's DLL exactly. Without it, a portable
+  prepass is used.
+- Output up to 3840×2160
 
-Other GPUs and drivers are untested; see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md).
+Tested on an RX 6700 XT (upstream) and an RX 9060 XT, both on Mesa RADV.
 
-## Install (3 steps)
+## NixOS / home-manager
 
-**1. Download and install** (paste into a terminal, no root needed):
+```nix
+# flake.nix
+inputs.bng-fsr4.url = "github:sidharthify/beamng-fsr4-linux-nix";
+
+# home-manager
+imports = [ inputs.bng-fsr4.homeManagerModules.default ];
+programs.bng-fsr4.enable = true;
+```
+
+This installs the layer manifest to `~/.local/share/vulkan/implicit_layer.d` and the menu-label mod to
+BeamNG's `mods` folder (`menuMod = false` skips the mod, `userFolder` moves it). The layer does nothing
+until the game is started with `BNG_FSR4=1`:
+
+- Steam launch options: `BNG_FSR4=1 %command%`
+- Or in a launcher script that wraps the game in `steam-run`: `export BNG_FSR4=1`
+
+Without home-manager, point the loader at the package directly:
 
 ```sh
-curl -fsSL https://github.com/Mob1K7105/beamng-fsr4-linux/releases/latest/download/beamng-fsr4-linux.tar.gz | tar xz && ./beamng-fsr4-linux-*/install.sh
+nix build github:sidharthify/beamng-fsr4-linux-nix
+BNG_FSR4=1 VK_ADD_IMPLICIT_LAYER_PATH=$PWD/result/share/vulkan/implicit_layer.d steam-run ./BinLinux/BeamNG.drive.x64
 ```
 
-Or download `beamng-fsr4-linux.tar.gz` from the [latest release](https://github.com/Mob1K7105/beamng-fsr4-linux/releases/latest),
-unpack it and run `./install.sh` inside.
-
-**2. Steam** → right-click BeamNG.drive → Properties → Launch Options:
-
-```
-BNG_FSR4=1 %command%
-```
-
-**3. In the game:** Options → Graphics → Anti-aliasing: **FSR 3 (custom)**, at any render scale. With the
-included menu mod it reads **FSR 4.1.1 (Linux)** while FSR 4 runs. The Sharpness slider still works.
-
-To uninstall: `~/.local/share/bng-fsr4/uninstall.sh`, then remove the launch option. Options, logs and
-troubleshooting: [docs/INSTALL.md](docs/INSTALL.md).
-
-## How it works
-
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) covers which BeamNG passes are intercepted, where FSR 4 gets
-its inputs, and how jitter, resets and fallback are handled.
-
-## Known limitations
-
-[docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
-
-## Reporting problems
-
-Open an issue with your GPU, Mesa version (`vulkaninfo --summary | grep driverInfo`), BeamNG version, output
-resolution, and the last `FSR4: frames replaced … hard …` lines of `~/.cache/bng-fsr4/events.log`.
-
-## Building from source
+## Other distros
 
 ```sh
-git clone --recursive https://github.com/Mob1K7105/beamng-fsr4-linux.git
-cd beamng-fsr4-linux
-./build.sh      # g++ with C++20 and libvulkan; output: build/libVkLayer_bng_fsr4.so
-./package.sh    # release tarball in dist/
+make && make install PREFIX=$HOME/.local
+cp ~/.local/share/bng-fsr4/bng_fsr4_linux.zip ~/.local/share/BeamNG/BeamNG.drive/current/mods/   # optional
 ```
 
-## Licensing and credits
+You need g++ and Vulkan headers 1.4.357 or newer. `PREFIX` has to be the final location, because the
+manifest refers to the library by its absolute path.
 
-The layer links GPL-2.0-or-later code and is therefore GPL-2.0-or-later. The FSR 4.1.1 shader/model
-assets are distributed under AMD's MIT exception for the upscaler DLL. Details and full credits are in
-[docs/LICENSING.md](docs/LICENSING.md).
+## Checking it works
+
+`~/.cache/bng-fsr4/events.log` logs `FSR4: backend constructed`, then every 600 frames:
+
+```
+FSR4: frames replaced 4801, fail-open 8, skipped chains 4800, soft 0, hard 0, jitter checked 4800 mismatched 0
+```
+
+`fail-open` counts frames that FSR 3 rendered (start-up, resets). `hard` should stay 0. With the mod
+enabled, the anti-aliasing menu shows "FSR 4.1.1 (Linux)" while the layer is running.
+
+## Options
+
+| Environment variable       | Effect                                                        |
+|----------------------------|---------------------------------------------------------------|
+| `BNG_FSR4=1`               | load the layer (required)                                     |
+| `BNG_FSR4_DISABLE=1`       | don't load it even when `BNG_FSR4` is set                     |
+| `BNG_FSR4_SHARPNESS=0.5`   | fixed sharpness 0–1 instead of following the game's slider    |
+| `BNG_FSR4_NO_SHARPEN=1`    | turn off FSR 4's RCAS                                         |
+| `BNG_FSR4_KEEP_FSR3=1`     | keep dispatching FSR 3's passes too (slower, for comparison)  |
+| `BNG_FSR4_ASSETS=dir`      | load the FSR 4.1.1 assets from `dir`                          |
+| `BNG_FSR4_USERFOLDER=dir`  | BeamNG user folder, for the menu-label status file            |
+
+While the game runs, creating `~/.cache/bng-fsr4/fsr4.disable` switches back to FSR 3 (after a 32-frame
+handover), and deleting it switches FSR 4 back on. `fsr3skip.disable` keeps FSR 3's passes running
+underneath FSR 4.
+
+## Limitations
+
+- FSR 4 costs more GPU time than FSR 3. Upstream measured about 1.4 ms per frame more at 1440p on an
+  RX 6700 XT. RDNA 2 has no WMMA/FP8, so the INT8 model runs on packed dot products. Pair it with a lower
+  render scale if you need the frames back.
+- After a reset that keeps the same size (e.g. toggling the upscaler), FSR 3 renders for 17–32 frames while
+  the jitter sequence is relearned.
+- Changing the output resolution while the game is running, HDR, VR and multi-monitor are untested.
+- The shader fingerprints are for BeamNG 0.40. After a game update the layer falls back to FSR 3 until
+  they are updated.
+
+How the interception works: [docs/how-it-works.md](docs/how-it-works.md). Licensing:
+[docs/licensing.md](docs/licensing.md). The layer is GPL-2.0-or-later. The FSR 4.1.1 shader and model
+assets are under AMD's MIT exception for the upscaler DLL.

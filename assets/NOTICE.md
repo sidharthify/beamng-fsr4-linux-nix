@@ -14,4 +14,3 @@ arithmetic is retained. These are modified assets, not an AMD-signed distributio
 
 `t1080` covers output up to 1920x1080; `t2160` covers larger output up to
 3840x2160. `m0` serves ratios through 2x; `m1` is the 3x Ultra Performance model.
-All files have pinned SHA256 hashes in ../dependencies.json.

@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // bbport: FSR 4.1.1 replay on Vulkan (fsr411.h). The frame is the DLL's 29 dispatches: SPD auto
 // exposure, prepass, pass0_post, model passes 1..12 each followed by its _post pass (tensor border
-// clears), postpass, RCAS. The rules for group counts, the tensor size table and the constants
-// are the ones tools/fsr4cap/extract.py checks against the recorded D3D12 frames.
+// clears), postpass, RCAS. Group counts, the tensor size table and the constants follow the
+// recorded D3D12 frames.
 
 #include "fsr411.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -228,6 +226,7 @@ bool Reflect(const std::vector<uint32_t>& words, Reflection& out, std::string& e
 // ---- implementation ---------------------------------------------------------------------------
 
 struct Upscaler::Impl {
+    const Dispatch vk;
     VkPhysicalDevice physical;
     VkDevice device;
     std::string dir;
@@ -236,7 +235,6 @@ struct Upscaler::Impl {
     std::string error;
     VkPhysicalDeviceMemoryProperties memory{};
     VkDeviceSize ubo_align = 256;
-    PFN_vkCmdPushDescriptorSetKHR push_descriptors = nullptr;
 
     // Current set and sizes.
     std::string set;
@@ -273,66 +271,18 @@ struct Upscaler::Impl {
     std::vector<uint8_t> initializer_data;
     uint64_t frame_index = 0;
     float previous_pre_exposure = 0.0f;
-    // BB_FSR4_PROFILE=1: GPU time per pass, read when a ring slot is reused, printed every 300 frames.
-    VkQueryPool profile_pool = VK_NULL_HANDLE;
-    float period_ns = 1.0f;
-    std::array<uint32_t, kFramesInFlight> profile_count{};
-    std::array<std::array<uint8_t, kPassCount>, kFramesInFlight> profile_pass{};
-    std::array<double, kPassCount> profile_ms{};
-    uint64_t profile_frames = 0;
 
-    Impl(VkPhysicalDevice p, VkDevice d, std::string dir_, bool mixed, bool sizes)
-        : physical{p}, device{d}, dir{std::move(dir_)}, mixed_float_dot{mixed}, subgroup_size_control{sizes} {
-        vkGetPhysicalDeviceMemoryProperties(physical, &memory);
+    Impl(const Dispatch& vk_, VkPhysicalDevice p, VkDevice d, std::string dir_, bool mixed, bool sizes)
+        : vk{vk_}, physical{p}, device{d}, dir{std::move(dir_)}, mixed_float_dot{mixed},
+          subgroup_size_control{sizes} {
+        vk.GetPhysicalDeviceMemoryProperties(physical, &memory);
         VkPhysicalDeviceProperties props;
-        vkGetPhysicalDeviceProperties(physical, &props);
+        vk.GetPhysicalDeviceProperties(physical, &props);
         ubo_align = std::max<VkDeviceSize>(256, props.limits.minUniformBufferOffsetAlignment);
-        push_descriptors = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>(
-            vkGetDeviceProcAddr(device, "vkCmdPushDescriptorSetKHR"));
-        period_ns = props.limits.timestampPeriod;
-        const char* profile = std::getenv("BB_FSR4_PROFILE");
-        if (profile && profile[0] == '1') {
-            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
-            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qci.queryCount = kFramesInFlight * (kPassCount + 1);
-            if (vkCreateQueryPool(device, &qci, nullptr, &profile_pool) != VK_SUCCESS) {
-                profile_pool = VK_NULL_HANDLE;
-            }
-        }
-    }
-
-    void CollectProfile(uint32_t slot) {
-        const uint32_t count = profile_count[slot];
-        if (!profile_pool || !count) {
-            return;
-        }
-        profile_count[slot] = 0;
-        std::array<uint64_t, kPassCount + 1> ts{};
-        if (vkGetQueryPoolResults(device, profile_pool, slot * (kPassCount + 1), count + 1,
-                                  sizeof(ts), ts.data(), 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
-            return;
-        }
-        for (uint32_t i = 0; i < count; ++i) {
-            profile_ms[profile_pass[slot][i]] += double(ts[i + 1] - ts[i]) * period_ns * 1e-6;
-        }
-        if (++profile_frames % 300) {
-            return;
-        }
-        double total = 0.0;
-        for (double ms : profile_ms) total += ms;
-        std::printf("FSR 4.1.1 profile: %.3f ms/frame\n", total / 300.0);
-        for (uint32_t p = 0; p < kPassCount; ++p) {
-            if (profile_ms[p] > 0.0) {
-                std::printf("  %6.3f ms/frame  %s\n", profile_ms[p] / 300.0, kPasses[p]);
-            }
-            profile_ms[p] = 0.0;
-        }
-        std::fflush(stdout);
     }
 
     ~Impl() {
         Destroy();
-        if (profile_pool) vkDestroyQueryPool(device, profile_pool, nullptr);
     }
 
     uint32_t MemoryType(uint32_t bits, VkMemoryPropertyFlags flags) const {
@@ -352,7 +302,7 @@ struct Upscaler::Impl {
             error = "no memory type";
             return false;
         }
-        if (vkAllocateMemory(device, &ai, nullptr, &out) != VK_SUCCESS) {
+        if (vk.AllocateMemory(device, &ai, nullptr, &out) != VK_SUCCESS) {
             error = "out of memory";
             return false;
         }
@@ -363,21 +313,21 @@ struct Upscaler::Impl {
         VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         ci.size = size;
         ci.usage = usage;
-        if (vkCreateBuffer(device, &ci, nullptr, &b.buffer) != VK_SUCCESS) {
+        if (vk.CreateBuffer(device, &ci, nullptr, &b.buffer) != VK_SUCCESS) {
             error = "buffer creation failed";
             return false;
         }
         VkMemoryRequirements req;
-        vkGetBufferMemoryRequirements(device, b.buffer, &req);
+        vk.GetBufferMemoryRequirements(device, b.buffer, &req);
         const VkMemoryPropertyFlags flags =
             host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         if (!Allocate(req, flags, b.memory) ||
-            vkBindBufferMemory(device, b.buffer, b.memory, 0) != VK_SUCCESS) {
+            vk.BindBufferMemory(device, b.buffer, b.memory, 0) != VK_SUCCESS) {
             return false;
         }
         b.size = size;
-        if (host && vkMapMemory(device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped) != VK_SUCCESS) {
+        if (host && vk.MapMemory(device, b.memory, 0, VK_WHOLE_SIZE, 0, &b.mapped) != VK_SUCCESS) {
             error = "map failed";
             return false;
         }
@@ -395,14 +345,14 @@ struct Upscaler::Impl {
         ci.tiling = VK_IMAGE_TILING_OPTIMAL;
         ci.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        if (vkCreateImage(device, &ci, nullptr, &img.image) != VK_SUCCESS) {
+        if (vk.CreateImage(device, &ci, nullptr, &img.image) != VK_SUCCESS) {
             error = "image creation failed";
             return false;
         }
         VkMemoryRequirements req;
-        vkGetImageMemoryRequirements(device, img.image, &req);
+        vk.GetImageMemoryRequirements(device, img.image, &req);
         if (!Allocate(req, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, img.memory) ||
-            vkBindImageMemory(device, img.image, img.memory, 0) != VK_SUCCESS) {
+            vk.BindImageMemory(device, img.image, img.memory, 0) != VK_SUCCESS) {
             return false;
         }
         VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -410,7 +360,7 @@ struct Upscaler::Impl {
         vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
         vi.format = format;
         vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        if (vkCreateImageView(device, &vi, nullptr, &img.view) != VK_SUCCESS) {
+        if (vk.CreateImageView(device, &vi, nullptr, &img.view) != VK_SUCCESS) {
             error = "image view creation failed";
             return false;
         }
@@ -418,27 +368,26 @@ struct Upscaler::Impl {
     }
 
     void FreeImage(Img& img) {
-        if (img.view) vkDestroyImageView(device, img.view, nullptr);
-        if (img.image) vkDestroyImage(device, img.image, nullptr);
-        if (img.memory) vkFreeMemory(device, img.memory, nullptr);
+        if (img.view) vk.DestroyImageView(device, img.view, nullptr);
+        if (img.image) vk.DestroyImage(device, img.image, nullptr);
+        if (img.memory) vk.FreeMemory(device, img.memory, nullptr);
         img = {};
     }
 
     void FreeBuffer(Buf& b) {
-        if (b.buffer) vkDestroyBuffer(device, b.buffer, nullptr);
-        if (b.memory) vkFreeMemory(device, b.memory, nullptr);
+        if (b.buffer) vk.DestroyBuffer(device, b.buffer, nullptr);
+        if (b.memory) vk.FreeMemory(device, b.memory, nullptr);
         b = {};
     }
 
     void Destroy() {
         for (Pass& p : passes) {
-            if (p.pipeline) vkDestroyPipeline(device, p.pipeline, nullptr);
-            if (p.layout) vkDestroyPipelineLayout(device, p.layout, nullptr);
-            if (p.set_layout) vkDestroyDescriptorSetLayout(device, p.set_layout, nullptr);
+            if (p.pipeline) vk.DestroyPipeline(device, p.pipeline, nullptr);
+            if (p.layout) vk.DestroyPipelineLayout(device, p.layout, nullptr);
+            if (p.set_layout) vk.DestroyDescriptorSetLayout(device, p.set_layout, nullptr);
             p = {};
         }
-        if (linear_clamp) vkDestroySampler(device, linear_clamp, nullptr);
-        profile_count = {};
+        if (linear_clamp) vk.DestroySampler(device, linear_clamp, nullptr);
         linear_clamp = VK_NULL_HANDLE;
         for (Img* img : {&recurrent, &history, &reprojected, &mlsr_output, &exposure,
                          &exposure_identity, &spd_atomic, &spd_mip5}) {
@@ -458,7 +407,7 @@ struct Upscaler::Impl {
         const std::string file = name == "prepass" && !mixed_float_dot ? "prepass_portable" : name;
         const std::string path = dir + "/" + set + "/" + file + ".spv";
         if (!ReadFile(path, bytes) || bytes.size() % 4) {
-            error = "missing " + path + " (tools/fsr4cap: capture and extract the FSR 4.1.1 assets)";
+            error = "missing " + path + "";
             return false;
         }
         std::vector<uint32_t> words(bytes.size() / 4);
@@ -513,9 +462,9 @@ struct Upscaler::Impl {
         mci.codeSize = bytes.size();
         mci.pCode = words.data();
         VkShaderModule module = VK_NULL_HANDLE;
-        if (vkCreateDescriptorSetLayout(device, &sci, nullptr, &p.set_layout) != VK_SUCCESS ||
-            vkCreatePipelineLayout(device, &lci, nullptr, &p.layout) != VK_SUCCESS ||
-            vkCreateShaderModule(device, &mci, nullptr, &module) != VK_SUCCESS) {
+        if (vk.CreateDescriptorSetLayout(device, &sci, nullptr, &p.set_layout) != VK_SUCCESS ||
+            vk.CreatePipelineLayout(device, &lci, nullptr, &p.layout) != VK_SUCCESS ||
+            vk.CreateShaderModule(device, &mci, nullptr, &module) != VK_SUCCESS) {
             error = path + ": layout or module creation failed";
             return false;
         }
@@ -531,8 +480,8 @@ struct Upscaler::Impl {
             wave.requiredSubgroupSize = kWave[index];
             pci.stage.pNext = &wave;
         }
-        const VkResult r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &pci, nullptr, &p.pipeline);
-        vkDestroyShaderModule(device, module, nullptr);
+        const VkResult r = vk.CreateComputePipelines(device, VK_NULL_HANDLE, 1, &pci, nullptr, &p.pipeline);
+        vk.DestroyShaderModule(device, module, nullptr);
         if (r != VK_SUCCESS) {
             error = path + ": pipeline creation failed (" + std::to_string(int(r)) + ")";
             return false;
@@ -542,10 +491,6 @@ struct Upscaler::Impl {
 
     bool Create(const std::string& wanted, uint32_t ow, uint32_t oh, bool tier2160) {
         Destroy();
-        if (!push_descriptors) {
-            error = "VK_KHR_push_descriptor is required";
-            return false;
-        }
         set = wanted;
         out_w = ow;
         out_h = oh;
@@ -554,7 +499,7 @@ struct Upscaler::Impl {
         si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.maxLod = VK_LOD_CLAMP_NONE;
-        if (vkCreateSampler(device, &si, nullptr, &linear_clamp) != VK_SUCCESS) {
+        if (vk.CreateSampler(device, &si, nullptr, &linear_clamp) != VK_SUCCESS) {
             error = "sampler creation failed";
             return false;
         }
@@ -615,21 +560,21 @@ struct Upscaler::Impl {
             b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             to_general.push_back(b);
         }
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              0, 0, nullptr, 0, nullptr, uint32_t(to_general.size()), to_general.data());
         const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         const VkClearColorValue zero{}, one{{1.0f, 1.0f, 1.0f, 1.0f}};
         for (Img* img : {&recurrent, &history, &reprojected, &mlsr_output, &exposure, &spd_atomic, &spd_mip5}) {
-            vkCmdClearColorImage(cmd, img->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+            vk.CmdClearColorImage(cmd, img->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
         }
-        vkCmdClearColorImage(cmd, exposure_identity.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
-        vkCmdFillBuffer(cmd, scratch.buffer, 0, VK_WHOLE_SIZE, 0);
+        vk.CmdClearColorImage(cmd, exposure_identity.image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
+        vk.CmdFillBuffer(cmd, scratch.buffer, 0, VK_WHOLE_SIZE, 0);
         const VkBufferCopy copy{0, 0, 131072};
-        vkCmdCopyBuffer(cmd, staging.buffer, initializer.buffer, 1, &copy);
+        vk.CmdCopyBuffer(cmd, staging.buffer, initializer.buffer, 1, &copy);
         VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                              0, 1, &mb, 0, nullptr, 0, nullptr);
         uploaded = true;
     }
@@ -662,13 +607,6 @@ struct Upscaler::Impl {
         // Constant buffers of this frame: MLSR, SPD, RCAS.
         const uint32_t ring = uint32_t(frame_index++ % kFramesInFlight);
         const VkDeviceSize slot = ring * 4 * ubo_align;
-        CollectProfile(ring);
-        const uint32_t query_base = ring * (kPassCount + 1);
-        uint32_t profiled = 0;
-        if (profile_pool) {
-            vkCmdResetQueryPool(cmd, profile_pool, query_base, kPassCount + 1);
-            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_pool, query_base);
-        }
         auto* base = static_cast<uint8_t*>(ubo.mapped) + slot;
         struct Mlsr {
             float inv_size[2], scale[2], inv_scale[2], jitter[2], mv_scale[2], tex_size[2],
@@ -785,8 +723,8 @@ struct Upscaler::Impl {
                 }
                 ++count;
             }
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
-            push_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, count, writes.data());
+            vk.CmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+            vk.CmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, count, writes.data());
             uint32_t gx = 1, gy = 1;
             switch (p.kind) {
             case Kind::Spd:
@@ -821,24 +759,32 @@ struct Upscaler::Impl {
                 break;
             }
             }
-            vkCmdDispatch(cmd, gx, gy, 1);
-            if (profile_pool) {
-                vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, profile_pool,
-                                    query_base + 1 + profiled);
-                profile_pass[ring][profiled++] = uint8_t(index);
-            }
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            vk.CmdDispatch(cmd, gx, gy, 1);
+            vk.CmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &between, 0, nullptr, 0,
                                  nullptr);
         }
-        profile_count[ring] = profiled;
         return true;
     }
 };
 
-Upscaler::Upscaler(VkPhysicalDevice physical, VkDevice device, std::string dir,
+bool Dispatch::Load(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, PFN_vkGetDeviceProcAddr gdpa,
+                    VkDevice device) {
+    bool ok = true;
+#define FSR411_LOAD_INSTANCE(name)                                                                 \
+    ok &= (name = reinterpret_cast<PFN_vk##name>(gipa(instance, "vk" #name))) != nullptr;
+#define FSR411_LOAD_DEVICE(name)                                                                   \
+    ok &= (name = reinterpret_cast<PFN_vk##name>(gdpa(device, "vk" #name))) != nullptr;
+    FSR411_INSTANCE_FUNCS(FSR411_LOAD_INSTANCE)
+    FSR411_DEVICE_FUNCS(FSR411_LOAD_DEVICE)
+#undef FSR411_LOAD_INSTANCE
+#undef FSR411_LOAD_DEVICE
+    return ok;
+}
+
+Upscaler::Upscaler(const Dispatch& vk, VkPhysicalDevice physical, VkDevice device, std::string dir,
                    bool mixed_float_dot, bool subgroup_size_control)
-    : impl{std::make_unique<Impl>(physical, device, std::move(dir), mixed_float_dot,
+    : impl{std::make_unique<Impl>(vk, physical, device, std::move(dir), mixed_float_dot,
                                   subgroup_size_control)} {}
 
 Upscaler::~Upscaler() = default;

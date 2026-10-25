@@ -5,8 +5,8 @@
     "type": "GLOBAL",
     "library_path": "@LIBRARY@",
     "api_version": "1.4.0",
-    "implementation_version": "1",
-    "description": "Unofficial FSR 4.1.1 for BeamNG.drive on native Linux (replaces the game's FSR 3 custom upscaler)",
+    "implementation_version": "2",
+    "description": "FSR 4.1.1 in place of BeamNG.drive's FSR 3 (custom) upscaler, native Linux build",
     "functions": {
       "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
     },
